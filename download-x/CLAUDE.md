@@ -43,7 +43,7 @@ Expected: version string (`2026.x.x`), then a dry-run log. If the tweet requires
 ## How to Run
 
 ```bash
-# Batch mode — reads from urls.txt
+# Batch mode — reads from inputs/urls.txt
 python twitter-vids-downloader.py
 
 # Single or multiple URLs

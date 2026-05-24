@@ -43,7 +43,7 @@ Expected: version string (`2026.x.x`), then a dry-run log ending with `[info] Ba
 ## How to Run
 
 ```bash
-# Batch mode — reads from urls.txt
+# Batch mode — reads from inputs/urls.txt
 python youtube-vids-downloader.py
 
 # Single or multiple URLs
@@ -83,7 +83,7 @@ Node.js is optional — used by yt-dlp for JavaScript-based video sources.
 
 ## Authentication
 
-Place a `cookies.txt` file in the project root directory. If present, it is passed to yt-dlp automatically. Useful for downloading age-restricted or members-only content.
+Place a `cookies.txt` file at `inputs/cookies.txt`. If present, it is passed to yt-dlp automatically. Useful for downloading age-restricted or members-only content.
 
 ## Error Handling
 

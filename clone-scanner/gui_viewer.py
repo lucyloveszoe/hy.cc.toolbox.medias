@@ -7,19 +7,23 @@ gui_viewer.py
 ──────────
 图片（两步）
   Step-1 [SAME]    : 文件大小 + 图片尺寸（像素宽高）完全相同 → 视为"完全相同"
-  Step-2 [SIMILAR] : pHash + wHash 双哈希距离均 ≤ HASH_THRESHOLD → 视为"内容相似"
+  Step-2 [SIMILAR] : pHash + wHash 双哈希距离均 ≤ 阈值 → 视为"内容相似"
 
 视频（两步）
   Step-1 [SAME]    : 文件大小 + 视频分辨率 + 时长（秒，精度 1s）完全相同 → 视为"完全相同"
-  Step-2 [SIMILAR] : 前 300s 均匀取 10 帧，任意一帧对 pHash+wHash 均 ≤ HASH_THRESHOLD → 视为"内容相似"
+  Step-2 [SIMILAR] : 前 N 秒均匀取 K 帧，任意一帧对 pHash+wHash 均 ≤ 阈值 → 视为"内容相似"
 
 GUI 功能
 ──────────
-  • 顶部 Tab：「图片」/ 「视频」分开展示
+  • 图片 Tab：独立扫描控制（开始 / 取消 / 清除）+ 相似度阈值
+  • 视频 Tab：独立扫描控制（开始 / 取消 / 清除）+ 相似度阈值 + 采样帧数 + 采样时长
+  • 取消扫描不丢弃已完成的部分结果；清除才重置历史
+  • 每次「开始扫描」会先清除上一次结果再重新扫描
   • 左侧分组树：[SAME]/[SIMILAR] 标签 + 文件数 + 总大小
   • 右侧预览区：并排展示缩略图、完整路径、大小、修改时间
   • 可勾选 → 移入回收站 / 永久删除
   • 保留最新、保留最大、全选/取消快捷操作
+  • 第三个 Tab：视频帧预览（对任意视频抽帧浏览）
 
 用法：
     python gui_viewer.py [源目录]    # 不填则启动后弹窗选择目录
@@ -33,6 +37,7 @@ import platform
 import threading
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -53,18 +58,17 @@ except ImportError:
     HAS_SEND2TRASH = False
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-HASH_THRESHOLD    = 15          # pHash / wHash 汉明距离阈值（两者都满足才判为 SIMILAR）
-THUMB_SIZE        = (200, 200)  # 图片/视频相似组缩略图尺寸
-VIDEO_PREVIEW_SIZE = (256, 256) # 第三个Tab帧预览尺寸，对齐系统 Extra Large Icons
-VIDEO_SAMPLE_SECS = 300.0       # 视频采样窗口（秒）
-VIDEO_SAMPLE_N    = 10          # 采样帧数（前300秒均匀取10帧）
+HASH_THRESHOLD     = 15
+THUMB_SIZE         = (200, 200)
+VIDEO_PREVIEW_SIZE = (256, 256)
+VIDEO_SAMPLE_SECS  = 300.0
+VIDEO_SAMPLE_N     = 10
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".heic"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".m4v", ".webm"}
 
 IS_MAC     = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
 
-# 颜色 / 字体
 BG_DARK   = "#1e1e2e"
 BG_MID    = "#2a2a3e"
 BG_CARD   = "#313149"
@@ -90,7 +94,6 @@ def fmt_size(n: int) -> str:
 
 
 def open_file(path: Path):
-    """跨平台打开文件。"""
     try:
         if IS_MAC:
             subprocess.Popen(["open", str(path)])
@@ -103,7 +106,6 @@ def open_file(path: Path):
 
 
 def recycle_file(path: Path):
-    """跨平台移入回收站。优先用 send2trash，否则直接删除。"""
     if HAS_SEND2TRASH:
         send2trash(str(path))
     else:
@@ -111,7 +113,6 @@ def recycle_file(path: Path):
 
 
 def get_image_meta(path: Path) -> tuple | None:
-    """返回 (file_size, width, height)；失败返回 None。"""
     try:
         sz = path.stat().st_size
         with Image.open(path) as img:
@@ -122,7 +123,6 @@ def get_image_meta(path: Path) -> tuple | None:
 
 
 def get_image_hashes(path: Path) -> tuple | None:
-    """返回 (phash, whash)；失败返回 None。"""
     try:
         with Image.open(path) as img:
             rgb = img.convert("RGB")
@@ -132,10 +132,6 @@ def get_image_hashes(path: Path) -> tuple | None:
 
 
 def get_video_meta(path: Path) -> tuple | None:
-    """
-    用 ffprobe 读取视频元数据。
-    返回 (file_size, width, height, duration_sec)；失败返回 None。
-    """
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -150,16 +146,14 @@ def get_video_meta(path: Path) -> tuple | None:
         rotate = 0
         for s in data.get("streams", []):
             if s.get("codec_type") == "video":
-                w   = s.get("width")
-                h   = s.get("height")
-                dur = float(s.get("duration", 0) or 0)
-                # 读取旋转元数据（手机竖拍视频常见 rotate=90 或 270）
+                w      = s.get("width")
+                h      = s.get("height")
+                dur    = float(s.get("duration", 0) or 0)
                 rotate = int(s.get("tags", {}).get("rotate", 0) or 0)
                 break
         if dur is None:
             dur = float(data.get("format", {}).get("duration", 0) or 0)
         if w and h:
-            # 旋转 90° / 270° 时宽高互换，统一为"显示后"的分辨率再比较
             if rotate in (90, 270):
                 w, h = h, w
             return (sz, w, h, round(dur))
@@ -172,12 +166,6 @@ def extract_video_frames(video_path: Path,
                           n_frames: int = VIDEO_SAMPLE_N,
                           max_seconds: float = VIDEO_SAMPLE_SECS,
                           _last_error: list | None = None) -> list:
-    """
-    在视频前 max_seconds 秒内均匀提取 n_frames 帧，返回 PIL Image 列表。
-    若视频时长 < max_seconds，则在整个视频内均匀采样。
-    会从 stream 与 format 两处读取时长；若仍为 0 则按 1 秒窗口取帧。
-    若传入 _last_error=[], 失败时会在其中写入一条 ffmpeg 报错信息（供 GUI 显示）。
-    """
     frames = []
     tmp_paths = []
     last_err = _last_error if isinstance(_last_error, list) else None
@@ -199,7 +187,6 @@ def extract_video_frames(video_path: Path,
             if duration <= 0:
                 duration = float(data.get("format", {}).get("duration", 0) or 0)
 
-        # 时长为 0 或未知时用 1 秒窗口，避免在 120s 处取帧导致失败
         sample_end = min(duration, max_seconds) if duration > 0 else min(1.0, max_seconds)
         if sample_end <= 0:
             sample_end = 1.0
@@ -226,10 +213,7 @@ def extract_video_frames(video_path: Path,
                     "-vf", "scale=iw:ih",
                     tmp_path,
                 ])
-                r2 = subprocess.run(
-                    cmd,
-                    capture_output=True, text=True, timeout=20
-                )
+                r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
                 if r2.returncode == 0 and Path(tmp_path).exists() and Path(tmp_path).stat().st_size > 0:
                     img = Image.open(tmp_path).convert("RGB")
                     img.load()
@@ -243,7 +227,6 @@ def extract_video_frames(video_path: Path,
 
         frames = run_ffmpeg(use_autorotate=True)
         if not frames and timestamps:
-            # 旧版 ffmpeg 可能不支持 -autorotate，重试一次
             frames = run_ffmpeg(use_autorotate=False)
     except Exception as e:
         if last_err is not None:
@@ -260,17 +243,14 @@ def extract_video_frames(video_path: Path,
 
 
 def extract_first_frame(video_path: Path) -> "Image.Image | None":
-    """提取视频首帧，用于缩略图预览。"""
     frames = extract_video_frames(video_path, n_frames=1, max_seconds=5)
     return frames[0] if frames else None
 
 
-def get_video_hashes(path: Path) -> list | None:
-    """
-    在视频前 300 秒内均匀取 10 帧，返回每帧的 (phash, whash) 列表。
-    若无法提取任何帧则返回 None。
-    """
-    frames = extract_video_frames(path, n_frames=VIDEO_SAMPLE_N, max_seconds=VIDEO_SAMPLE_SECS)
+def get_video_hashes(path: Path,
+                     n_frames: int = VIDEO_SAMPLE_N,
+                     max_seconds: float = VIDEO_SAMPLE_SECS) -> list | None:
+    frames = extract_video_frames(path, n_frames=n_frames, max_seconds=max_seconds)
     if not frames:
         return None
     result = []
@@ -280,17 +260,6 @@ def get_video_hashes(path: Path) -> list | None:
         except Exception:
             pass
     return result if result else None
-
-
-def videos_are_similar(hashes_a: list, hashes_b: list) -> bool:
-    """
-    任意一对帧的 phash 和 whash 距离都 <= HASH_THRESHOLD，判为相似。
-    """
-    for ph_a, wh_a in hashes_a:
-        for ph_b, wh_b in hashes_b:
-            if (ph_a - ph_b) <= HASH_THRESHOLD and (wh_a - wh_b) <= HASH_THRESHOLD:
-                return True
-    return False
 
 
 def make_thumbnail(path: Path) -> "ImageTk.PhotoImage | None":
@@ -313,16 +282,14 @@ def make_thumbnail(path: Path) -> "ImageTk.PhotoImage | None":
 # ── 分组逻辑 ──────────────────────────────────────────────────────────────────
 
 class Group:
-    """代表一组相似文件，携带标签 'SAME' 或 'SIMILAR'。"""
     __slots__ = ("files", "label")
 
     def __init__(self, files: list[Path], label: str):
         self.files = files
-        self.label = label   # "SAME" | "SIMILAR"
+        self.label = label
 
 
-def collect_files(sources: "Path | list[Path]") -> tuple[list[Path], list[Path]]:
-    """分别收集图片列表和视频列表，支持单个或多个目录，每个目录递归搜索。"""
+def collect_files(sources) -> tuple[list[Path], list[Path]]:
     if isinstance(sources, Path):
         sources = [sources]
     images, videos = [], []
@@ -353,30 +320,48 @@ def _make_union_find(n: int):
     return parent, find, union
 
 
-def build_image_groups(images: list[Path], progress_cb=None) -> list[Group]:
+def _groups_from_uf(files: list[Path], find, total: int, same_pairs: set) -> list:
+    raw: dict[int, list[int]] = defaultdict(list)
+    for i in range(total):
+        raw[find(i)].append(i)
+    groups = []
+    for idxs in raw.values():
+        if len(idxs) < 2:
+            continue
+        fs = [files[i] for i in idxs]
+        pairs_in_group = {(min(a, b), max(a, b)) for a in idxs for b in idxs if a != b}
+        label = "SAME" if pairs_in_group.issubset(same_pairs) else "SIMILAR"
+        groups.append(Group(fs, label))
+    return groups
+
+
+def build_image_groups(images: list[Path],
+                       progress_cb=None,
+                       cancel_event=None,
+                       threshold: int = HASH_THRESHOLD) -> list:
     """
-    图片两步分组：
-      Step-1 [SAME]    : 文件大小 + 尺寸完全相同
-      Step-2 [SIMILAR] : 双哈希距离均 ≤ HASH_THRESHOLD
+    图片两步分组。若 cancel_event 触发则返回当前已完成的部分结果。
     """
     total = len(images)
     if total == 0:
         return []
 
     parent, find, union = _make_union_find(total)
-    same_pairs: set[tuple[int, int]] = set()
+    same_pairs: set = set()
 
-    # Step-1：读元数据
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    # Step 1: meta → SAME groups
     meta_map: dict[tuple, list[int]] = defaultdict(list)
     for i, f in enumerate(images):
+        if _cancelled():
+            break
         m = get_image_meta(f)
         if m:
             meta_map[m].append(i)
         if progress_cb:
-            progress_cb(
-                "image_meta", i + 1, total, f, "读取图片元数据…"
-            )
-
+            progress_cb("image_meta", i + 1, total, f, "读取图片元数据…")
     for idxs in meta_map.values():
         if len(idxs) >= 2:
             for k in range(1, len(idxs)):
@@ -384,73 +369,68 @@ def build_image_groups(images: list[Path], progress_cb=None) -> list[Group]:
                 union(a, b)
                 same_pairs.add((min(a, b), max(a, b)))
 
-    # Step-2：计算哈希
+    # Step 2a: compute hashes
     hashes: list[tuple | None] = [None] * total
-    for i, f in enumerate(images):
-        h = get_image_hashes(f)
-        if h is not None:
-            hashes[i] = h
-        if progress_cb:
-            progress_cb(
-                "image_hash", i + 1, total, f, "计算图片哈希…"
-            )
+    if not _cancelled():
+        for i, f in enumerate(images):
+            if _cancelled():
+                break
+            h = get_image_hashes(f)
+            if h is not None:
+                hashes[i] = h
+            if progress_cb:
+                progress_cb("image_hash", i + 1, total, f, "计算图片哈希…")
 
-    valid = [(i, hashes[i]) for i in range(total) if hashes[i] is not None]
-    n = len(valid)
-    total_pairs = n * (n - 1) // 2
-    done = 0
-    for a in range(n):
-        ia, (ph_a, wh_a) = valid[a]
-        for b in range(a + 1, n):
-            ib, (ph_b, wh_b) = valid[b]
-            if (ph_a - ph_b) <= HASH_THRESHOLD and (wh_a - wh_b) <= HASH_THRESHOLD:
-                union(ia, ib)
-            done += 1
-            if progress_cb and done % 10000 == 0:
-                progress_cb(
-                    "image_compare", done, total_pairs, None, "比对图片相似度…"
-                )
+    # Step 2b: pairwise comparison
+    if not _cancelled():
+        valid = [(i, hashes[i]) for i in range(total) if hashes[i] is not None]
+        n = len(valid)
+        total_pairs = n * (n - 1) // 2
+        done = 0
+        for a in range(n):
+            if _cancelled():
+                break
+            ia, (ph_a, wh_a) = valid[a]
+            for b in range(a + 1, n):
+                ib, (ph_b, wh_b) = valid[b]
+                if (ph_a - ph_b) <= threshold and (wh_a - wh_b) <= threshold:
+                    union(ia, ib)
+                done += 1
+                if progress_cb and done % 10000 == 0:
+                    progress_cb("image_compare", done, total_pairs, None, "比对图片相似度…")
 
-    # 聚合
-    raw: dict[int, list[int]] = defaultdict(list)
-    for i in range(total):
-        raw[find(i)].append(i)
-
-    groups = []
-    for idxs in raw.values():
-        if len(idxs) < 2:
-            continue
-        files = [images[i] for i in idxs]
-        pairs_in_group = {(min(a, b), max(a, b)) for a in idxs for b in idxs if a != b}
-        label = "SAME" if pairs_in_group.issubset(same_pairs) else "SIMILAR"
-        groups.append(Group(files, label))
-    return groups
+    return _groups_from_uf(images, find, total, same_pairs)
 
 
-def build_video_groups(videos: list[Path], progress_cb=None) -> list[Group]:
+def build_video_groups(videos: list[Path],
+                       progress_cb=None,
+                       cancel_event=None,
+                       threshold: int = HASH_THRESHOLD,
+                       sample_n: int = VIDEO_SAMPLE_N,
+                       sample_secs: float = VIDEO_SAMPLE_SECS) -> list:
     """
-    视频两步分组：
-      Step-1 [SAME]    : 文件大小 + 分辨率 + 时长完全相同
-      Step-2 [SIMILAR] : 前300s取10帧，任意帧对双哈希距离均 ≤ HASH_THRESHOLD
+    视频两步分组。若 cancel_event 触发则返回当前已完成的部分结果。
     """
     total = len(videos)
     if total == 0:
         return []
 
     parent, find, union = _make_union_find(total)
-    same_pairs: set[tuple[int, int]] = set()
+    same_pairs: set = set()
 
-    # Step-1：读元数据
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    # Step 1: meta → SAME groups
     meta_map: dict[tuple, list[int]] = defaultdict(list)
     for i, f in enumerate(videos):
+        if _cancelled():
+            break
         m = get_video_meta(f)
         if m:
             meta_map[m].append(i)
         if progress_cb:
-            progress_cb(
-                "video_meta", i + 1, total, f, "读取视频元数据…"
-            )
-
+            progress_cb("video_meta", i + 1, total, f, "读取视频元数据…")
     for idxs in meta_map.values():
         if len(idxs) >= 2:
             for k in range(1, len(idxs)):
@@ -458,98 +438,99 @@ def build_video_groups(videos: list[Path], progress_cb=None) -> list[Group]:
                 union(a, b)
                 same_pairs.add((min(a, b), max(a, b)))
 
-    # Step-2：前 120 秒多帧哈希
+    # Step 2a: compute frame hashes
     hashes: list[list | None] = []
     valid_idx: list[int] = []
-    for i, f in enumerate(videos):
-        h = get_video_hashes(f)
-        if h is not None:
-            hashes.append(h)
-            valid_idx.append(i)
-        if progress_cb:
-            progress_cb(
-                "video_hash",
-                i + 1,
-                total,
-                f,
-                f"计算视频多帧哈希（前{int(VIDEO_SAMPLE_SECS)}s）…",
-            )
+    if not _cancelled():
+        for i, f in enumerate(videos):
+            if _cancelled():
+                break
+            h = get_video_hashes(f, n_frames=sample_n, max_seconds=sample_secs)
+            if h is not None:
+                hashes.append(h)
+                valid_idx.append(i)
+            if progress_cb:
+                progress_cb("video_hash", i + 1, total, f,
+                            f"计算视频多帧哈希（前{int(sample_secs)}s）…")
 
-    n = len(valid_idx)
-    total_pairs = n * (n - 1) // 2
-    done = 0
-    for a in range(n):
-        ia = valid_idx[a]
-        for b in range(a + 1, n):
-            ib = valid_idx[b]
-            if videos_are_similar(hashes[a], hashes[b]):
-                union(ia, ib)
-            done += 1
-            if progress_cb and done % 50 == 0:
-                progress_cb(
-                    "video_compare", done, total_pairs, None, "比对视频相似度…"
-                )
+    # Step 2b: pairwise comparison
+    if not _cancelled():
+        n = len(valid_idx)
+        total_pairs = n * (n - 1) // 2
+        done = 0
+        for a in range(n):
+            if _cancelled():
+                break
+            ia = valid_idx[a]
+            for b in range(a + 1, n):
+                ib = valid_idx[b]
+                if _videos_similar(hashes[a], hashes[b], threshold):
+                    union(ia, ib)
+                done += 1
+                if progress_cb and done % 50 == 0:
+                    progress_cb("video_compare", done, total_pairs, None, "比对视频相似度…")
 
-    # 聚合
-    raw: dict[int, list[int]] = defaultdict(list)
-    for i in range(total):
-        raw[find(i)].append(i)
+    return _groups_from_uf(videos, find, total, same_pairs)
 
-    groups = []
-    for idxs in raw.values():
-        if len(idxs) < 2:
-            continue
-        files = [videos[i] for i in idxs]
-        pairs_in_group = {(min(a, b), max(a, b)) for a in idxs for b in idxs if a != b}
-        label = "SAME" if pairs_in_group.issubset(same_pairs) else "SIMILAR"
-        groups.append(Group(files, label))
-    return groups
+
+def _videos_similar(hashes_a: list, hashes_b: list, threshold: int) -> bool:
+    for ph_a, wh_a in hashes_a:
+        for ph_b, wh_b in hashes_b:
+            if (ph_a - ph_b) <= threshold and (wh_a - wh_b) <= threshold:
+                return True
+    return False
 
 
 # ── Tab 面板（图片 or 视频） ───────────────────────────────────────────────────
 
 class MediaTab(tk.Frame):
     """
-    一个 Tab 面板，包含：
+    独立的图片或视频扫描 Tab，内含：
+      - 顶部控制栏：开始 / 取消 / 清除 + 该媒体类型专属参数
       - 左侧分组树
-      - 右侧预览区（缩略图 + 信息 + 勾选）
-      - 底部操作按钮
+      - 右侧预览区
+    取消扫描保留已找到的部分结果；开始扫描会先清除上次结果。
     """
 
-    def __init__(self, master, tab_label: str, app: "App"):
+    def __init__(self, master, media_type: str, app: "App"):
         super().__init__(master, bg=BG_DARK)
-        self.tab_label = tab_label   # "图片" or "视频"
-        self.app       = app
+        self.media_type  = media_type   # "photo" | "video"
+        self.app         = app
         self.groups: list[Group] = []
-        self._thumb_refs: list   = []
+        self._all_files: list[Path] = []
+        self._thumb_refs: list = []
         self._check_vars: dict[str, tk.BooleanVar] = {}
-
+        self._cancel_event = threading.Event()
+        self._scanning = False
         self._build_layout()
 
+    # ── Layout ────────────────────────────────────────────────────────────────
+
     def _build_layout(self):
+        self._build_control_bar()
+
         paned = tk.PanedWindow(self, orient="horizontal", bg=BG_DARK,
                                sashwidth=5, sashrelief="flat")
         paned.pack(fill="both", expand=True)
 
-        # ── 左侧分组树 ──
+        # Left: group tree
         left = tk.Frame(paned, bg=BG_MID, width=320)
         paned.add(left, minsize=220)
 
-        tk.Label(left, text=f"{self.tab_label} 相似组",
+        label_text = "图片相似组" if self.media_type == "photo" else "视频相似组"
+        tk.Label(left, text=label_text,
                  font=FONT_BOLD, bg=BG_MID, fg=FG_TEXT, pady=6).pack(fill="x")
 
         tree_frame = tk.Frame(left, bg=BG_MID)
         tree_frame.pack(fill="both", expand=True)
 
+        style_name = "DarkPhoto.Treeview" if self.media_type == "photo" else "DarkVideo.Treeview"
         style = ttk.Style()
-        style_name = f"Dark{self.tab_label}.Treeview"
         style.configure(style_name,
-                         background=BG_MID, foreground=FG_TEXT,
-                         fieldbackground=BG_MID, rowheight=26,
-                         font=FONT_SMALL)
+                        background=BG_MID, foreground=FG_TEXT,
+                        fieldbackground=BG_MID, rowheight=26, font=FONT_SMALL)
         style.configure(f"{style_name}.Heading",
-                         background=BG_CARD, foreground=ACCENT,
-                         font=FONT_BOLD)
+                        background=BG_CARD, foreground=ACCENT, font=FONT_BOLD)
         style.map(style_name,
                   background=[("selected", BG_CARD)],
                   foreground=[("selected", ACCENT)])
@@ -572,7 +553,7 @@ class MediaTab(tk.Frame):
         vsb.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self._on_group_select)
 
-        # ── 右侧预览区 ──
+        # Right: preview canvas
         right = tk.Frame(paned, bg=BG_DARK)
         paned.add(right, minsize=600)
 
@@ -589,20 +570,233 @@ class MediaTab(tk.Frame):
         self.preview_frame.bind("<Configure>", self._on_preview_configure)
         self.preview_canvas.bind("<Configure>", self._on_canvas_configure)
         self.preview_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        # macOS trackpad 滚动
-        self.preview_canvas.bind_all("<Button-4>", self._on_trackpad_up)
-        self.preview_canvas.bind_all("<Button-5>", self._on_trackpad_down)
+        self.preview_canvas.bind_all("<Button-4>",   self._on_trackpad_up)
+        self.preview_canvas.bind_all("<Button-5>",   self._on_trackpad_down)
 
-    # ── 填充树 ────────────────────────────────────────────────────────────────
+    def _build_control_bar(self):
+        bar = tk.Frame(self, bg=BG_MID, pady=5, padx=8)
+        bar.pack(fill="x", side="top")
+
+        # Action buttons
+        self._start_btn = tk.Button(
+            bar, text="▶ 开始扫描", font=FONT_MAIN,
+            bg=ACCENT, fg=BG_DARK, relief="flat", padx=10,
+            command=self._on_start_click)
+        self._start_btn.pack(side="left", padx=(0, 3))
+
+        self._cancel_btn = tk.Button(
+            bar, text="⏹ 取消", font=FONT_MAIN,
+            bg="#4a1e1e", fg=RED, relief="flat", padx=10,
+            state="disabled", command=self._on_cancel_click)
+        self._cancel_btn.pack(side="left", padx=3)
+
+        self._clear_btn = tk.Button(
+            bar, text="✕ 清除结果", font=FONT_MAIN,
+            bg=BG_CARD, fg=FG_DIM, relief="flat", padx=10,
+            command=self._on_clear_click)
+        self._clear_btn.pack(side="left", padx=3)
+
+        # Divider
+        tk.Frame(bar, bg=FG_DIM, width=1).pack(side="left", fill="y", padx=10, pady=3)
+
+        # Similarity threshold (both photo and video)
+        tk.Label(bar, text="相似阈值:", font=FONT_SMALL,
+                 bg=BG_MID, fg=FG_DIM).pack(side="left", padx=(0, 2))
+        self._threshold_var = tk.IntVar(value=HASH_THRESHOLD)
+        tk.Label(bar, textvariable=self._threshold_var, font=FONT_BOLD,
+                 bg=BG_MID, fg=ACCENT, width=3).pack(side="left")
+        tk.Scale(bar, from_=1, to=30, orient="horizontal",
+                 variable=self._threshold_var,
+                 bg=BG_MID, fg=FG_TEXT, troughcolor=BG_CARD,
+                 highlightthickness=0, showvalue=False, length=100,
+                 command=lambda _: None).pack(side="left", padx=2)
+        tk.Button(bar, text="Apply", font=FONT_SMALL,
+                  bg=BG_CARD, fg=FG_TEXT, relief="flat", padx=6,
+                  command=self._apply_threshold).pack(side="left", padx=(0, 4))
+
+        # Video-only parameters
+        if self.media_type == "video":
+            tk.Frame(bar, bg=FG_DIM, width=1).pack(side="left", fill="y", padx=10, pady=3)
+
+            tk.Label(bar, text="采样帧数:", font=FONT_SMALL,
+                     bg=BG_MID, fg=FG_DIM).pack(side="left", padx=(0, 2))
+            self._sample_n_var = tk.IntVar(value=VIDEO_SAMPLE_N)
+            tk.Label(bar, textvariable=self._sample_n_var, font=FONT_BOLD,
+                     bg=BG_MID, fg=ACCENT, width=3).pack(side="left")
+            tk.Scale(bar, from_=1, to=30, orient="horizontal",
+                     variable=self._sample_n_var,
+                     bg=BG_MID, fg=FG_TEXT, troughcolor=BG_CARD,
+                     highlightthickness=0, showvalue=False, length=80,
+                     command=lambda _: None).pack(side="left", padx=2)
+
+            tk.Label(bar, text="时长(s):", font=FONT_SMALL,
+                     bg=BG_MID, fg=FG_DIM).pack(side="left", padx=(8, 2))
+            self._sample_secs_var = tk.IntVar(value=int(VIDEO_SAMPLE_SECS))
+            tk.Label(bar, textvariable=self._sample_secs_var, font=FONT_BOLD,
+                     bg=BG_MID, fg=ACCENT, width=4).pack(side="left")
+            tk.Scale(bar, from_=30, to=600, orient="horizontal",
+                     variable=self._sample_secs_var, resolution=30,
+                     bg=BG_MID, fg=FG_TEXT, troughcolor=BG_CARD,
+                     highlightthickness=0, showvalue=False, length=80,
+                     command=lambda _: None).pack(side="left", padx=2)
+
+        # Right side: progress bar + status label
+        self._progress_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(bar, variable=self._progress_var,
+                        maximum=100, length=160).pack(side="right", padx=(0, 4))
+        self._status_var = tk.StringVar(value="就绪 — 请选择目录后开始扫描")
+        tk.Label(bar, textvariable=self._status_var, font=FONT_SMALL,
+                 bg=BG_MID, fg=FG_DIM, anchor="w").pack(side="right", padx=(4, 8))
+
+    # ── Scan control ──────────────────────────────────────────────────────────
+
+    def start_scan(self, source_dirs: list[Path]):
+        if self._scanning:
+            return
+        valid = [d for d in source_dirs if d.exists()]
+        if not valid:
+            return
+        # Always clear previous results before a new scan
+        self._clear_results()
+        self._cancel_event.clear()
+        self._scanning = True
+        self._update_btn_states()
+        self._status_var.set("正在收集文件…")
+        self._progress_var.set(0)
+        threading.Thread(target=self._scan_thread, args=(valid,), daemon=True).start()
+
+    def _on_start_click(self):
+        valid = [d for d in self.app.source_dirs if d.exists()]
+        if not valid:
+            messagebox.showwarning("提示", "请先在工具栏选择一个有效目录。")
+            return
+        self.start_scan(valid)
+
+    def _on_cancel_click(self):
+        if not self._scanning:
+            return
+        self._cancel_event.set()
+        self._status_var.set("正在取消…（已找到的结果将保留）")
+        self._cancel_btn.configure(state="disabled")
+
+    def _on_clear_click(self):
+        if self._scanning:
+            return
+        self._clear_results()
+        self._status_var.set("就绪")
+        self._progress_var.set(0)
+        if self.media_type == "video":
+            self.app.on_video_scan_complete([])
+
+    def _apply_threshold(self):
+        valid = [d for d in self.app.source_dirs if d.exists()]
+        if valid:
+            self.start_scan(valid)
+        else:
+            messagebox.showwarning("提示", "请先选择一个有效目录。")
+
+    def _update_btn_states(self):
+        if self._scanning:
+            self._start_btn.configure(state="disabled")
+            self._cancel_btn.configure(state="normal")
+            self._clear_btn.configure(state="disabled")
+        else:
+            self._start_btn.configure(state="normal")
+            self._cancel_btn.configure(state="disabled")
+            self._clear_btn.configure(state="normal")
+
+    # ── Scan thread ───────────────────────────────────────────────────────────
+
+    def _scan_thread(self, source_dirs: list[Path]):
+        try:
+            _last_update = [0.0]
+
+            def progress_cb(kind, done, total, path, msg):
+                now = time.monotonic()
+                if now - _last_update[0] < 0.5 and done < total:
+                    return
+                _last_update[0] = now
+                pct = done / total * 100 if total else 0
+                desc = f"{msg} ({done}/{total})"
+                self.after(0, lambda p=pct, m=desc: (
+                    self._progress_var.set(p),
+                    self._status_var.set(m),
+                ))
+                if path is not None:
+                    print(f"[{kind}] {done}/{total} ({pct:.1f}%) - {path}", flush=True)
+
+            threshold = self._threshold_var.get()
+
+            if self.media_type == "photo":
+                images, _ = collect_files(source_dirs)
+                self.after(0, lambda n=len(images): self._status_var.set(
+                    f"图片 {n} 张，正在分析…"))
+                groups = build_image_groups(
+                    images,
+                    progress_cb=progress_cb,
+                    cancel_event=self._cancel_event,
+                    threshold=threshold)
+
+            else:  # video
+                _, videos = collect_files(source_dirs)
+                self._all_files = list(videos)
+                self.after(0, lambda n=len(videos): self._status_var.set(
+                    f"视频 {n} 个，正在分析…"))
+                sample_n    = self._sample_n_var.get()
+                sample_secs = float(self._sample_secs_var.get())
+                groups = build_video_groups(
+                    videos,
+                    progress_cb=progress_cb,
+                    cancel_event=self._cancel_event,
+                    threshold=threshold,
+                    sample_n=sample_n,
+                    sample_secs=sample_secs)
+
+            groups.sort(key=lambda g: (0 if g.label == "SAME" else 1, -len(g.files)))
+            cancelled = self._cancel_event.is_set()
+            self.after(0, lambda g=groups, c=cancelled: self._on_scan_done(g, c))
+
+        except Exception as e:
+            self.after(0, lambda err=str(e): self._status_var.set(f"扫描出错: {err}"))
+        finally:
+            self._scanning = False
+            self.after(0, self._update_btn_states)
+
+    def _on_scan_done(self, groups: list[Group], cancelled: bool):
+        self.populate(groups)
+        same = sum(1 for g in groups if g.label == "SAME")
+        sim  = len(groups) - same
+
+        if cancelled:
+            self._status_var.set(
+                f"已取消（部分结果：{len(groups)} 组，{same} 相同 / {sim} 相似）")
+            # keep progress bar where it was
+        elif groups:
+            self._status_var.set(f"完成：{len(groups)} 组（{same} 相同 / {sim} 相似）")
+            self._progress_var.set(100)
+        else:
+            label = "图片" if self.media_type == "photo" else "视频"
+            self._status_var.set(f"未发现相似{label}")
+            self._progress_var.set(100)
+
+        if self.media_type == "video":
+            self.app.on_video_scan_complete(self._all_files)
+
+    def _clear_results(self):
+        self.groups = []
+        self._all_files = []
+        self._check_vars.clear()
+        self._thumb_refs.clear()
+        self._clear_tree()
+        self._clear_preview()
+
+    # ── Tree population ───────────────────────────────────────────────────────
 
     def populate(self, groups: list[Group]):
         self.groups = groups
         self._check_vars.clear()
         self._clear_tree()
         self._clear_preview()
-
-        same_count = sum(1 for g in groups if g.label == "SAME")
-        sim_count  = len(groups) - same_count
 
         for i, grp in enumerate(groups, 1):
             total_bytes = sum(f.stat().st_size for f in grp.files if f.exists())
@@ -618,41 +812,36 @@ class MediaTab(tk.Frame):
             self.tree.selection_set(children[0])
             self.tree.focus(children[0])
 
-        return same_count, sim_count
-
-    def clear(self):
-        self.groups = []
-        self._check_vars.clear()
-        self._clear_tree()
-        self._clear_preview()
-
-    # ── 预览 ──────────────────────────────────────────────────────────────────
+    # ── Preview ───────────────────────────────────────────────────────────────
 
     def _on_group_select(self, _event=None):
         sel = self.tree.selection()
         if not sel:
             return
         idx = self.tree.index(sel[0])
-        self._show_preview(self.groups[idx])
+        if idx < len(self.groups):
+            self._show_preview(self.groups[idx])
 
     def _show_preview(self, grp: Group):
         self._clear_preview()
         self._thumb_refs.clear()
 
         MAX_PREVIEW = 40
-        all_files = sorted(grp.files, key=lambda p: p.stat().st_size if p.exists() else 0,
+        all_files = sorted(grp.files,
+                           key=lambda p: p.stat().st_size if p.exists() else 0,
                            reverse=True)
-        files = all_files[:MAX_PREVIEW]
+        files  = all_files[:MAX_PREVIEW]
         hidden = len(all_files) - len(files)
 
-        canvas_w  = self.preview_canvas.winfo_width()
-        card_w    = THUMB_SIZE[0] + 60
+        canvas_w     = self.preview_canvas.winfo_width()
+        card_w       = THUMB_SIZE[0] + 60
         cols_per_row = max(1, canvas_w // card_w) if canvas_w > 50 else 3
 
         tag_color = YELLOW if grp.label == "SAME" else ACCENT
-        total_str = f"（共 {len(all_files)} 个，显示前 {MAX_PREVIEW} 个）" if hidden else f"（共 {len(all_files)} 个）"
-        tag_text  = "✦ 完全相同（文件大小 + 尺寸一致）" if grp.label == "SAME" \
-                    else "≈ 内容相似（视觉帧哈希匹配）"
+        total_str = (f"（共 {len(all_files)} 个，显示前 {MAX_PREVIEW} 个）"
+                     if hidden else f"（共 {len(all_files)} 个）")
+        tag_text  = ("✦ 完全相同（文件大小 + 尺寸一致）" if grp.label == "SAME"
+                     else "≈ 内容相似（视觉帧哈希匹配）")
         banner = tk.Label(self.preview_frame, text=f"{tag_text}  {total_str}",
                           font=FONT_BOLD, bg=BG_MID, fg=tag_color,
                           pady=4, anchor="w", padx=12)
@@ -672,9 +861,8 @@ class MediaTab(tk.Frame):
                 self._check_vars[key] = tk.BooleanVar(value=False)
             var = self._check_vars[key]
             tk.Checkbutton(card, variable=var, bg=BG_CARD,
-                           activebackground=BG_CARD,
-                           selectcolor=BG_DARK, fg=RED,
-                           text="标记删除", font=FONT_SMALL).pack(anchor="w")
+                           activebackground=BG_CARD, selectcolor=BG_DARK,
+                           fg=RED, text="标记删除", font=FONT_SMALL).pack(anchor="w")
 
             thumb_lbl = tk.Label(card, bg=BG_CARD, text="加载中…",
                                   fg=FG_DIM, font=FONT_SMALL,
@@ -719,12 +907,11 @@ class MediaTab(tk.Frame):
             tk.Label(card, text=f"修改: {mtime}",
                      font=FONT_SMALL, fg=FG_DIM, bg=BG_CARD).pack()
 
-        # 操作按钮行
+        # Action buttons row
         last_row = 1 + (len(files) - 1) // cols_per_row + 1
         ctrl = tk.Frame(self.preview_frame, bg=BG_DARK)
         ctrl.grid(row=last_row, column=0, columnspan=cols_per_row,
                   pady=8, sticky="w", padx=8)
-
         for text, cmd in [
             ("全选本组",           lambda g=grp: self._check_group(g, True)),
             ("取消全选",           lambda g=grp: self._check_group(g, False)),
@@ -736,12 +923,13 @@ class MediaTab(tk.Frame):
                       command=cmd).pack(side="left", padx=4)
 
         if hidden:
-            tk.Label(self.preview_frame,
-                     text=f"⚠ 还有 {hidden} 个文件未显示（勾选操作仍对全组 {len(all_files)} 个文件生效）",
-                     font=FONT_SMALL, bg=BG_DARK, fg=YELLOW,
-                     pady=4, padx=12, anchor="w"
-                     ).grid(row=last_row + 1, column=0, columnspan=cols_per_row,
-                            sticky="ew", pady=(0, 8))
+            tk.Label(
+                self.preview_frame,
+                text=f"⚠ 还有 {hidden} 个文件未显示（勾选操作仍对全组 {len(all_files)} 个文件生效）",
+                font=FONT_SMALL, bg=BG_DARK, fg=YELLOW,
+                pady=4, padx=12, anchor="w",
+            ).grid(row=last_row + 1, column=0, columnspan=cols_per_row,
+                   sticky="ew", pady=(0, 8))
 
     def _load_thumb(self, path: Path, label: tk.Label):
         photo = make_thumbnail(path)
@@ -752,7 +940,7 @@ class MediaTab(tk.Frame):
         else:
             self.after(0, lambda lbl=label: lbl.configure(text="无法预览"))
 
-    # ── 操作 ──────────────────────────────────────────────────────────────────
+    # ── Selection helpers ─────────────────────────────────────────────────────
 
     def _check_group(self, grp: Group, checked: bool):
         for p in grp.files:
@@ -787,7 +975,7 @@ class MediaTab(tk.Frame):
             messagebox.showinfo("提示", "请先勾选要删除的文件。")
             return False
 
-        action = "永久删除" if permanent else "移入回收站"
+        action  = "永久删除" if permanent else "移入回收站"
         preview = "\n".join(str(t) for t in targets[:10])
         if len(targets) > 10:
             preview += f"\n…还有 {len(targets)-10} 个"
@@ -811,7 +999,7 @@ class MediaTab(tk.Frame):
             messagebox.showinfo("完成", f"已{action} {len(targets)} 个文件。")
         return True
 
-    # ── 布局辅助 ──────────────────────────────────────────────────────────────
+    # ── Layout helpers ────────────────────────────────────────────────────────
 
     def _clear_tree(self):
         for item in self.tree.get_children():
@@ -822,14 +1010,12 @@ class MediaTab(tk.Frame):
             w.destroy()
 
     def _on_preview_configure(self, _event):
-        self.preview_canvas.configure(
-            scrollregion=self.preview_canvas.bbox("all"))
+        self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
 
     def _on_canvas_configure(self, event):
         self.preview_canvas.itemconfig(self._preview_win, width=event.width)
 
     def _on_mousewheel(self, event):
-        # Windows / Linux
         self.preview_canvas.yview_scroll(-1 * (event.delta // 120), "units")
 
     def _on_trackpad_up(self, _event):
@@ -841,13 +1027,9 @@ class MediaTab(tk.Frame):
 
 # ── 第三个 Tab：视频帧预览 ─────────────────────────────────────────────────────
 
-
 class VideoPreviewTab(tk.Frame):
     """
-    第三个 Tab：
-      - 左侧列出所有视频文件
-      - 右侧展示当前选中视频抽取的多帧预览图
-      - 支持对视频执行与其它 Tab 一致的删除操作
+    Tab：列出所有视频文件，右侧展示选中视频的多帧预览图。
     """
 
     def __init__(self, master, app: "App"):
@@ -863,12 +1045,17 @@ class VideoPreviewTab(tk.Frame):
                                sashwidth=5, sashrelief="flat")
         paned.pack(fill="both", expand=True)
 
-        # 左侧：视频列表
+        # Left: video list
         left = tk.Frame(paned, bg=BG_MID, width=320)
         paned.add(left, minsize=220)
 
-        tk.Label(left, text="视频列表",
-                 font=FONT_BOLD, bg=BG_MID, fg=FG_TEXT, pady=6).pack(fill="x")
+        hdr = tk.Frame(left, bg=BG_MID)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="视频列表",
+                 font=FONT_BOLD, bg=BG_MID, fg=FG_TEXT, pady=6).pack(side="left", padx=8)
+        tk.Button(hdr, text="✕ 清除", font=FONT_SMALL,
+                  bg=BG_CARD, fg=FG_DIM, relief="flat", padx=6,
+                  command=self.clear).pack(side="right", padx=8, pady=4)
 
         tree_frame = tk.Frame(left, bg=BG_MID)
         tree_frame.pack(fill="both", expand=True)
@@ -877,21 +1064,19 @@ class VideoPreviewTab(tk.Frame):
         style_name = "DarkPreview.Treeview"
         style.configure(style_name,
                         background=BG_MID, foreground=FG_TEXT,
-                        fieldbackground=BG_MID, rowheight=24,
-                        font=FONT_SMALL)
+                        fieldbackground=BG_MID, rowheight=24, font=FONT_SMALL)
         style.configure(f"{style_name}.Heading",
-                        background=BG_CARD, foreground=ACCENT,
-                        font=FONT_BOLD)
+                        background=BG_CARD, foreground=ACCENT, font=FONT_BOLD)
 
         self.tree = ttk.Treeview(tree_frame, style=style_name,
                                  columns=("duration", "size"),
                                  show="tree headings", selectmode="browse")
-        self.tree.heading("#0", text="文件名")
+        self.tree.heading("#0",       text="文件名")
         self.tree.heading("duration", text="时长")
-        self.tree.heading("size", text="大小")
-        self.tree.column("#0", width=160, stretch=True)
-        self.tree.column("duration", width=70, anchor="center")
-        self.tree.column("size", width=80, anchor="e")
+        self.tree.heading("size",     text="大小")
+        self.tree.column("#0",       width=160, stretch=True)
+        self.tree.column("duration", width=70,  anchor="center")
+        self.tree.column("size",     width=80,  anchor="e")
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -899,7 +1084,7 @@ class VideoPreviewTab(tk.Frame):
         vsb.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self._on_video_select)
 
-        # 右侧：帧预览
+        # Right: frame preview
         right = tk.Frame(paned, bg=BG_DARK)
         paned.add(right, minsize=600)
 
@@ -916,10 +1101,10 @@ class VideoPreviewTab(tk.Frame):
         self.preview_frame.bind("<Configure>", self._on_preview_configure)
         self.preview_canvas.bind("<Configure>", self._on_canvas_configure)
         self.preview_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.preview_canvas.bind_all("<Button-4>", self._on_trackpad_up)
-        self.preview_canvas.bind_all("<Button-5>", self._on_trackpad_down)
+        self.preview_canvas.bind_all("<Button-4>",   self._on_trackpad_up)
+        self.preview_canvas.bind_all("<Button-5>",   self._on_trackpad_down)
 
-    # ── 对外接口 ───────────────────────────────────────────────────────────────
+    # ── Public interface ──────────────────────────────────────────────────────
 
     def populate(self, videos: list[Path]):
         self.videos = [v for v in videos if v.exists()]
@@ -929,23 +1114,15 @@ class VideoPreviewTab(tk.Frame):
 
         for v in self.videos:
             try:
-                st = v.stat()
-                size_str = fmt_size(st.st_size)
+                size_str = fmt_size(v.stat().st_size)
             except Exception:
                 size_str = "N/A"
-            meta = get_video_meta(v)
+            meta    = get_video_meta(v)
             dur_str = f"{meta[3]}s" if meta else "?"
+            fname   = v.name if len(v.name) <= 32 else v.name[:29] + "…"
+            self.tree.insert("", "end", iid=str(v),
+                             text=fname, values=(dur_str, size_str))
 
-            fname = v.name if len(v.name) <= 32 else v.name[:29] + "…"
-            self.tree.insert(
-                "",
-                "end",
-                iid=str(v),
-                text=fname,
-                values=(dur_str, size_str),
-            )
-
-        # 默认选中第一条
         children = self.tree.get_children()
         if children:
             self.tree.selection_set(children[0])
@@ -958,22 +1135,20 @@ class VideoPreviewTab(tk.Frame):
         self._clear_tree()
         self._clear_preview()
 
-    # ── 事件 / 预览 ──────────────────────────────────────────────────────────
+    # ── Events / preview ──────────────────────────────────────────────────────
 
     def _on_video_select(self, _event=None):
         sel = self.tree.selection()
         if not sel:
             return
         path = Path(sel[0])
-        if not path.exists():
-            return
-        self._show_frames(path)
+        if path.exists():
+            self._show_frames(path)
 
     def _show_frames(self, video_path: Path):
         self._clear_preview()
         self._thumb_refs.clear()
 
-        # 勾选状态按视频为单位
         key = str(video_path)
         if key not in self._check_vars:
             self._check_vars[key] = tk.BooleanVar(value=False)
@@ -981,29 +1156,14 @@ class VideoPreviewTab(tk.Frame):
 
         header = tk.Frame(self.preview_frame, bg=BG_DARK)
         header.pack(fill="x", pady=(4, 6), padx=8)
+        tk.Checkbutton(header, text="标记此视频删除", variable=var,
+                       bg=BG_DARK, activebackground=BG_DARK,
+                       selectcolor=BG_CARD, fg=RED,
+                       font=FONT_SMALL).pack(side="left")
+        tk.Label(header, text=str(video_path), font=FONT_SMALL,
+                 fg=FG_DIM, bg=BG_DARK, wraplength=900,
+                 justify="left").pack(side="left", padx=10)
 
-        tk.Checkbutton(
-            header,
-            text="标记此视频删除",
-            variable=var,
-            bg=BG_DARK,
-            activebackground=BG_DARK,
-            selectcolor=BG_CARD,
-            fg=RED,
-            font=FONT_SMALL,
-        ).pack(side="left")
-
-        tk.Label(
-            header,
-            text=str(video_path),
-            font=FONT_SMALL,
-            fg=FG_DIM,
-            bg=BG_DARK,
-            wraplength=900,
-            justify="left",
-        ).pack(side="left", padx=10)
-
-        # 抽帧预览（传入 _last_error 以便失败时显示 ffmpeg 报错）
         last_error = []
         frames = extract_video_frames(
             video_path,
@@ -1016,15 +1176,9 @@ class VideoPreviewTab(tk.Frame):
             msg = "无法从该视频提取预览帧。"
             if last_error:
                 msg += "\n\n" + last_error[0]
-            tk.Label(
-                self.preview_frame,
-                text=msg,
-                font=FONT_SMALL,
-                fg=FG_DIM,
-                bg=BG_DARK,
-                justify="left",
-                wraplength=700,
-            ).pack(pady=20, padx=12)
+            tk.Label(self.preview_frame, text=msg, font=FONT_SMALL,
+                     fg=FG_DIM, bg=BG_DARK, justify="left",
+                     wraplength=700).pack(pady=20, padx=12)
             return
 
         row = tk.Frame(self.preview_frame, bg=BG_DARK)
@@ -1035,46 +1189,32 @@ class VideoPreviewTab(tk.Frame):
                 img = img.copy()
                 img.thumbnail(VIDEO_PREVIEW_SIZE, Image.LANCZOS)
                 padded = Image.new("RGB", VIDEO_PREVIEW_SIZE, (40, 40, 60))
-                offset = ((VIDEO_PREVIEW_SIZE[0] - img.width) // 2, (VIDEO_PREVIEW_SIZE[1] - img.height) // 2)
+                offset = ((VIDEO_PREVIEW_SIZE[0] - img.width) // 2,
+                          (VIDEO_PREVIEW_SIZE[1] - img.height) // 2)
                 padded.paste(img, offset)
                 ph = ImageTk.PhotoImage(padded)
                 self._thumb_refs.append(ph)
             except Exception:
                 continue
-
             card = tk.Frame(row, bg=BG_CARD, padx=6, pady=6)
             card.pack(side="left", padx=6, pady=4)
             tk.Label(card, image=ph, bg=BG_CARD).pack()
-            tk.Label(
-                card,
-                text=f"帧 {idx + 1}",
-                font=FONT_SMALL,
-                fg=FG_DIM,
-                bg=BG_CARD,
-            ).pack(pady=(4, 0))
+            tk.Label(card, text=f"帧 {idx + 1}", font=FONT_SMALL,
+                     fg=FG_DIM, bg=BG_CARD).pack(pady=(4, 0))
 
-        # 操作按钮行（对所有视频生效）
         ctrl = tk.Frame(self.preview_frame, bg=BG_DARK)
         ctrl.pack(fill="x", pady=10, padx=8)
-
         for text, cmd in [
-            ("全选本组", self._check_all),
-            ("取消全选", lambda: self._check_all(False)),
+            ("全选",             self._check_all),
+            ("取消全选",         lambda: self._check_all(False)),
             ("保留最新，其余勾选", self._keep_newest),
             ("保留最大，其余勾选", self._keep_largest),
         ]:
-            tk.Button(
-                ctrl,
-                text=text,
-                font=FONT_SMALL,
-                bg=BG_CARD,
-                fg=FG_TEXT,
-                relief="flat",
-                padx=8,
-                command=cmd,
-            ).pack(side="left", padx=4)
+            tk.Button(ctrl, text=text, font=FONT_SMALL,
+                      bg=BG_CARD, fg=FG_TEXT, relief="flat", padx=8,
+                      command=cmd).pack(side="left", padx=4)
 
-    # ── 删除逻辑（与 MediaTab 接口对齐） ───────────────────────────────────────
+    # ── Selection helpers ─────────────────────────────────────────────────────
 
     def _check_all(self, checked: bool = True):
         for v in self.videos:
@@ -1106,11 +1246,8 @@ class VideoPreviewTab(tk.Frame):
             self._check_vars[key].set(v != keep)
 
     def get_checked(self) -> list[Path]:
-        return [
-            Path(k)
-            for k, v in self._check_vars.items()
-            if v.get() and Path(k).exists()
-        ]
+        return [Path(k) for k, v in self._check_vars.items()
+                if v.get() and Path(k).exists()]
 
     def delete_checked(self, permanent: bool):
         targets = self.get_checked()
@@ -1118,14 +1255,11 @@ class VideoPreviewTab(tk.Frame):
             messagebox.showinfo("提示", "请先勾选要删除的视频。")
             return False
 
-        action = "永久删除" if permanent else "移入回收站"
+        action  = "永久删除" if permanent else "移入回收站"
         preview = "\n".join(str(t) for t in targets[:10])
         if len(targets) > 10:
             preview += f"\n…还有 {len(targets)-10} 个"
-        if not messagebox.askyesno(
-            "确认",
-            f"确定{action} {len(targets)} 个视频？\n\n{preview}",
-        ):
+        if not messagebox.askyesno("确认", f"确定{action} {len(targets)} 个视频？\n\n{preview}"):
             return False
 
         errors = []
@@ -1145,7 +1279,7 @@ class VideoPreviewTab(tk.Frame):
             messagebox.showinfo("完成", f"已{action} {len(targets)} 个视频。")
         return True
 
-    # ── 布局辅助 ──────────────────────────────────────────────────────────────
+    # ── Layout helpers ────────────────────────────────────────────────────────
 
     def _clear_tree(self):
         for item in self.tree.get_children():
@@ -1176,11 +1310,7 @@ class VideoPreviewTab(tk.Frame):
 class App(tk.Tk):
     def __init__(self, source_dirs: "list[Path] | None"):
         super().__init__()
-        # 支持多目录；单目录时也以列表形式存储
         self.source_dirs: list[Path] = source_dirs or []
-        self._all_videos: list[Path] = []
-        self._cancel_event = threading.Event()
-        self._scanning = False
 
         self.title("相似图片 / 视频查看器")
         self.geometry("1400x860")
@@ -1189,16 +1319,10 @@ class App(tk.Tk):
 
         self._build_ui()
 
-        valid = [d for d in self.source_dirs if d.exists()]
-        if valid:
-            self.after(100, self._start_scan)
-        else:
-            self.after(100, self._choose_dir)
-
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # 工具栏
+        # Toolbar — directory, bulk scan, export, delete
         toolbar = tk.Frame(self, bg=BG_MID, pady=6, padx=10)
         toolbar.pack(fill="x", side="top")
 
@@ -1209,24 +1333,13 @@ class App(tk.Tk):
                   bg=BG_CARD, fg=FG_TEXT, relief="flat", padx=10,
                   command=self._choose_dir).pack(side="left", padx=(20, 4))
 
-        tk.Button(toolbar, text="🔄 重新扫描", font=FONT_MAIN,
-                  bg=BG_CARD, fg=FG_TEXT, relief="flat", padx=10,
-                  command=self._start_scan).pack(side="left", padx=4)
-
-        self._cancel_btn = tk.Button(toolbar, text="⏹ 取消扫描", font=FONT_MAIN,
-                                     bg="#4a1e1e", fg=RED, relief="flat", padx=10,
-                                     state="disabled",
-                                     command=self._request_cancel)
-        self._cancel_btn.pack(side="left", padx=4)
-
         tk.Button(toolbar, text="📋 导出报告", font=FONT_MAIN,
                   bg=BG_CARD, fg=FG_TEXT, relief="flat", padx=10,
                   command=self._export_report).pack(side="left", padx=4)
 
         dir_text = "; ".join(str(d) for d in self.source_dirs) if self.source_dirs else "未选择目录"
-        self.dir_label = tk.Label(toolbar,
-                                  text=dir_text,
-                                  font=FONT_SMALL, bg=BG_MID, fg=FG_DIM)
+        self.dir_label = tk.Label(toolbar, text=dir_text,
+                                   font=FONT_SMALL, bg=BG_MID, fg=FG_DIM)
         self.dir_label.pack(side="left", padx=12)
 
         tk.Button(toolbar, text="🗑 永久删除勾选", font=FONT_MAIN,
@@ -1240,33 +1353,7 @@ class App(tk.Tk):
                   command=lambda: self._delete_checked(permanent=False)
                   ).pack(side="right", padx=4)
 
-        # 哈希阈值滑块
-        tk.Label(toolbar, text="阈值:", font=FONT_SMALL,
-                 bg=BG_MID, fg=FG_DIM).pack(side="right", padx=(12, 2))
-        self._threshold_var = tk.IntVar(value=HASH_THRESHOLD)
-        self._threshold_label = tk.Label(toolbar,
-                                         textvariable=self._threshold_var,
-                                         font=FONT_BOLD, bg=BG_MID, fg=ACCENT,
-                                         width=3)
-        self._threshold_label.pack(side="right")
-        self._threshold_slider = tk.Scale(
-            toolbar,
-            from_=1, to=30,
-            orient="horizontal",
-            variable=self._threshold_var,
-            bg=BG_MID, fg=FG_TEXT,
-            troughcolor=BG_CARD,
-            highlightthickness=0,
-            showvalue=False,
-            length=120,
-            command=lambda _: None,
-        )
-        self._threshold_slider.pack(side="right", padx=4)
-        tk.Button(toolbar, text="Apply", font=FONT_SMALL,
-                  bg=ACCENT, fg=BG_DARK, relief="flat", padx=8,
-                  command=self._apply_threshold).pack(side="right", padx=(0, 4))
-
-        # Notebook（Tab 切换）
+        # Notebook
         nb_style = ttk.Style()
         nb_style.theme_use("clam")
         nb_style.configure("Dark.TNotebook",
@@ -1281,26 +1368,36 @@ class App(tk.Tk):
         self.notebook = ttk.Notebook(self, style="Dark.TNotebook")
         self.notebook.pack(fill="both", expand=True)
 
-        self.img_tab = MediaTab(self.notebook, "图片", self)
-        self.vid_tab = MediaTab(self.notebook, "视频", self)
+        self.img_tab     = MediaTab(self.notebook, "photo", self)
+        self.vid_tab     = MediaTab(self.notebook, "video", self)
         self.preview_tab = VideoPreviewTab(self.notebook, self)
-        self.notebook.add(self.img_tab, text="  🖼  图片  ")
-        self.notebook.add(self.vid_tab, text="  🎬  视频  ")
+        self.notebook.add(self.img_tab,     text="  🖼  图片  ")
+        self.notebook.add(self.vid_tab,     text="  🎬  视频  ")
         self.notebook.add(self.preview_tab, text="  📷  视频帧预览  ")
 
-        # 状态栏
-        status_bar = tk.Frame(self, bg=BG_MID, pady=4, padx=10)
-        status_bar.pack(fill="x", side="bottom")
+    # ── Callbacks ─────────────────────────────────────────────────────────────
 
-        self.status_var = tk.StringVar(value="就绪 — 请选择目录后开始扫描")
-        tk.Label(status_bar, textvariable=self.status_var,
-                 font=FONT_SMALL, bg=BG_MID, fg=FG_DIM).pack(side="left")
+    def on_video_scan_complete(self, videos: list[Path]):
+        """Called by vid_tab when its scan finishes (or is cancelled/cleared)."""
+        self.preview_tab.populate(videos)
 
-        self.progress_var = tk.DoubleVar(value=0)
-        ttk.Progressbar(status_bar, variable=self.progress_var,
-                         maximum=100, length=220).pack(side="right", padx=8)
+    def _choose_dir(self):
+        init = str(self.source_dirs[0]) if self.source_dirs else str(Path.home())
+        d = filedialog.askdirectory(initialdir=init, title="选择要扫描的目录")
+        if d:
+            self.source_dirs = [Path(d)]
+            self.dir_label.configure(text=str(self.source_dirs[0]))
 
-    # ── 扫描 ──────────────────────────────────────────────────────────────────
+    def _delete_checked(self, permanent: bool):
+        idx = self.notebook.index(self.notebook.select())
+        if idx == 0:
+            self.img_tab.delete_checked(permanent)
+        elif idx == 1:
+            self.vid_tab.delete_checked(permanent)
+        else:
+            self.preview_tab.delete_checked(permanent)
+
+    # ── Export ────────────────────────────────────────────────────────────────
 
     def _export_report(self):
         img_groups = self.img_tab.groups
@@ -1313,9 +1410,9 @@ class App(tk.Tk):
         if not fmt:
             return
 
-        ext = ".csv" if fmt == "csv" else ".md"
+        ext          = ".csv" if fmt == "csv" else ".md"
         default_name = datetime.now().strftime(f"%Y-%m-%d-similarity-report{ext}")
-        out_path = filedialog.asksaveasfilename(
+        out_path     = filedialog.asksaveasfilename(
             title="保存报告",
             initialfile=default_name,
             defaultextension=ext,
@@ -1333,135 +1430,10 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
 
-    def _apply_threshold(self):
-        global HASH_THRESHOLD
-        HASH_THRESHOLD = self._threshold_var.get()
-        self._start_scan()
-
-    def _choose_dir(self):
-        init = str(self.source_dirs[0]) if self.source_dirs else str(Path.home())
-        d = filedialog.askdirectory(initialdir=init, title="选择要扫描的目录")
-        if d:
-            self.source_dirs = [Path(d)]
-            self.dir_label.configure(text=str(self.source_dirs[0]))
-            self._start_scan()
-
-    def _start_scan(self):
-        valid = [d for d in self.source_dirs if d.exists()]
-        if not valid:
-            messagebox.showwarning("提示", "请先选择一个有效目录。")
-            return
-        if self._scanning:
-            return
-        self._cancel_event.clear()
-        self._scanning = True
-        self._cancel_btn.configure(state="normal")
-        self.img_tab.clear()
-        self.vid_tab.clear()
-        self.preview_tab.clear()
-        dirs_str = "; ".join(str(d) for d in valid)
-        self.status_var.set(f"正在扫描 {dirs_str} …")
-        self.progress_var.set(0)
-        threading.Thread(target=self._scan_thread, daemon=True).start()
-
-    def _request_cancel(self):
-        if not self._scanning:
-            return
-        if messagebox.askyesno("确认取消", "确定要取消当前扫描吗？\n已完成的部分将丢失。"):
-            self._cancel_event.set()
-            self.status_var.set("正在取消扫描…")
-            self._cancel_btn.configure(state="disabled")
-
-    def _scan_thread(self):
-        import time
-        valid = [d for d in self.source_dirs if d.exists()]
-        images, videos = collect_files(valid)
-        self._all_videos = videos
-        self.after(0, lambda: self.status_var.set(
-            f"图片 {len(images)} 张 / 视频 {len(videos)} 个，正在分析…"))
-
-        _last_update = [0.0]
-        cancelled = [False]
-
-        def progress(kind, done, total, path, msg):
-            if self._cancel_event.is_set():
-                cancelled[0] = True
-                raise InterruptedError("用户取消")
-            now = time.monotonic()
-            if now - _last_update[0] < 0.5 and done < total:
-                return
-            _last_update[0] = now
-            pct = done / total * 100 if total else 0
-            desc = f"{msg} ({done}/{total})"
-            self.after(
-                0,
-                lambda p=pct, m=desc: (
-                    self.progress_var.set(p),
-                    self.status_var.set(m),
-                ),
-            )
-            if path is not None:
-                print(f"[{kind}] {msg} {done}/{total} ({pct:.1f}%) - {path}", flush=True)
-            else:
-                print(f"[{kind}] {msg} {done}/{total} ({pct:.1f}%)", flush=True)
-
-        try:
-            img_groups = build_image_groups(images, progress_cb=progress)
-            vid_groups = build_video_groups(videos, progress_cb=progress)
-        except InterruptedError:
-            self.after(0, self._on_scan_cancelled)
-            return
-        finally:
-            self._scanning = False
-            self.after(0, lambda: self._cancel_btn.configure(state="disabled"))
-
-        img_groups.sort(key=lambda g: (0 if g.label == "SAME" else 1, -len(g.files)))
-        vid_groups.sort(key=lambda g: (0 if g.label == "SAME" else 1, -len(g.files)))
-
-        self.after(0, lambda: self._populate_tabs(img_groups, vid_groups))
-
-    def _on_scan_cancelled(self):
-        self.status_var.set("扫描已取消")
-        self.progress_var.set(0)
-        print("[INFO] 扫描已由用户取消", flush=True)
-
-    def _populate_tabs(self, img_groups: list[Group], vid_groups: list[Group]):
-        img_same, img_sim = self.img_tab.populate(img_groups)
-        vid_same, vid_sim = self.vid_tab.populate(vid_groups)
-        # 第三个 Tab：使用所有原始视频列表进行预览
-        self.preview_tab.populate(self._all_videos)
-
-        total_groups = len(img_groups) + len(vid_groups)
-        self.status_var.set(
-            f"图片：{len(img_groups)} 组（{img_same} 相同 / {img_sim} 相似）  "
-            f"视频：{len(vid_groups)} 组（{vid_same} 相同 / {vid_sim} 相似）"
-        )
-        self.progress_var.set(100)
-
-        # 切到有结果的 Tab
-        if img_groups:
-            self.notebook.select(0)
-        elif vid_groups:
-            self.notebook.select(1)
-
-    # ── 删除（委托给当前激活 Tab） ────────────────────────────────────────────
-
-    def _delete_checked(self, permanent: bool):
-        idx = self.notebook.index(self.notebook.select())
-        if idx == 0:
-            tab = self.img_tab
-        elif idx == 1:
-            tab = self.vid_tab
-        else:
-            tab = self.preview_tab
-        # 删除后不自动重新扫描，由用户手动点击「🔄 重新扫描」决定
-        tab.delete_checked(permanent)
-
 
 # ── 导出辅助 ──────────────────────────────────────────────────────────────────
 
 def _ask_export_format(parent) -> str | None:
-    """弹窗让用户选择导出格式，返回 'csv' 或 'md' 或 None（取消）。"""
     result = [None]
     dlg = tk.Toplevel(parent)
     dlg.title("选择导出格式")
@@ -1502,8 +1474,8 @@ def _export_csv(out_path: Path, img_groups: list, vid_groups: list):
             for i, grp in enumerate(groups, 1):
                 for p in grp.files:
                     try:
-                        st = p.stat()
-                        size = st.st_size
+                        st    = p.stat()
+                        size  = st.st_size
                         mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
                     except Exception:
                         size = mtime = "N/A"
@@ -1512,11 +1484,11 @@ def _export_csv(out_path: Path, img_groups: list, vid_groups: list):
 
 def _export_markdown(out_path: Path, img_groups: list, vid_groups: list):
     lines = [
-        f"# 相似图片 / 视频报告",
-        f"",
+        "# 相似图片 / 视频报告",
+        "",
         f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ",
-        f"哈希阈值：{HASH_THRESHOLD}",
-        f"",
+        f"哈希阈值：（见各 Tab 设置）",
+        "",
     ]
     for media_type, groups in [("图片", img_groups), ("视频", vid_groups)]:
         if not groups:
@@ -1537,8 +1509,8 @@ def _export_markdown(out_path: Path, img_groups: list, vid_groups: list):
             ]
             for p in grp.files:
                 try:
-                    st = p.stat()
-                    size = fmt_size(st.st_size)
+                    st    = p.stat()
+                    size  = fmt_size(st.st_size)
                     mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
                 except Exception:
                     size = mtime = "N/A"
@@ -1552,14 +1524,12 @@ def _export_markdown(out_path: Path, img_groups: list, vid_groups: list):
 
 def main():
     if len(sys.argv) > 1:
-        # 支持一个或多个目录参数
         source_dirs = [Path(p) for p in sys.argv[1:]]
     elif IS_WINDOWS:
-        # Windows 下无参数时使用默认目录
         default = Path(r"C:\Temp\self\ss")
         source_dirs = [default] if default.exists() else []
     else:
-        source_dirs = []   # macOS / Linux：启动后弹窗让用户选择
+        source_dirs = []
 
     App(source_dirs).mainloop()
 

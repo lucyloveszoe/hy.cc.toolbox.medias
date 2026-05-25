@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Telegram credentials — never commit real values
+download-telegram/config*.py
+!download-telegram/config.example.py
+download-telegram/telegram_session
